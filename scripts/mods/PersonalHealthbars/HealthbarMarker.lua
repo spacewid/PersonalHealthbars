@@ -41,6 +41,8 @@ template.damage_number_settings = {
 	visibility_delay = 5,                     -- Задержка перед показом чисел урона (секунды)
 	expand_bonus_scale = 30,                 -- Дополнительный размер при расширении анимации
 	default_color = "white",                 -- Цвет обычного урона
+	dot_color = "purple",                     -- Цвет периодического урона (DoT)
+	dot_emit_interval = 2,                 -- Как часто показывать DoT-числа (секунды)
 	has_taken_damage_timer_y_offset = 34,    -- Смещение по Y для таймера урона
 	weakspot_color = "orange",               -- Цвет попадания в слабое место
 	fade_delay = 0.35,                       -- Задержка перед затуханием (секунды)
@@ -182,6 +184,7 @@ template.create_widget_defintion = function(template, scenegraph_id)
 				local hundreds_font_size = damage_number_settings.hundreds_font_size * scale
 				local font_type = ui_style.font_type
 				local default_color = Color[damage_number_settings.default_color](255, true)
+				local dot_color = Color[damage_number_settings.dot_color](255, true)
 				local crit_color = Color[damage_number_settings.crit_color](255, true)
 				local weakspot_color = Color[damage_number_settings.weakspot_color](255, true)
 				local text_color = table.clone(default_color)
@@ -199,7 +202,11 @@ template.create_widget_defintion = function(template, scenegraph_id)
 						damage_number.time = damage_number.time + ui_renderer.dt
 					end
 
-					if damage_number.was_critical then
+					if damage_number.is_periodic then
+						text_color[2] = dot_color[2]
+						text_color[3] = dot_color[3]
+						text_color[4] = dot_color[4]
+					elseif damage_number.was_critical then
 						text_color[2] = crit_color[2]
 						text_color[3] = crit_color[3]
 						text_color[4] = crit_color[4]
@@ -238,7 +245,7 @@ template.create_widget_defintion = function(template, scenegraph_id)
 						text_color[1] = text_color[1] * scale
 					end
 
-					local text = value
+					local text = math.ceil(value)
 					local size = ui_style.size
 					local current_order = num_damage_numbers - i
 
@@ -270,7 +277,7 @@ template.create_widget_defintion = function(template, scenegraph_id)
 						local dps = ui_content.damage_has_started_timer > 1
 								and ui_content.damage_taken / ui_content.damage_has_started_timer
 							or ui_content.damage_taken
-						local text = string.format("%d DPS", dps)
+						local text = string.format("%d DPS", math.ceil(dps))
 
 						UIRenderer.draw_text(
 							ui_renderer,
@@ -516,49 +523,113 @@ template.update_function = function(parent, ui_renderer, widget, marker, templat
 			local last_hit_info = mod._last_hit_info[unit]
 			local was_critical = false
 			local hit_weakspot = false
+			local attack_type = nil
+			-- Best-effort classification: if we can tell this tick was caused by a periodic effect,
+			-- we mark it, otherwise we leave it as normal direct damage.
+			local is_periodic_damage = false
 			if last_hit_info then
 				was_critical = last_hit_info.was_critical or false
 				hit_weakspot = last_hit_info.hit_weakspot or false
+				attack_type = last_hit_info.attack_type
 			end
 
-			if
-				latest_damage_number
-				and t - latest_damage_number.start_time < damage_number_settings.add_numbers_together_timer
-			then
-				should_add = false
+			-- SAFEST DoT detection approach:
+			-- 1) Use attack_type if it explicitly indicates non-weapon hits (varies by game/version).
+			-- 2) Otherwise, do a throttled check for common DoT debuff stacks on the target (cheap and stable),
+			--    and only when damage actually changed (not every frame).
+			if attack_type == "buff" or attack_type == "dot" then
+				is_periodic_damage = true
 			end
 
-			if content.add_on_next_number or was_critical or should_add then
-				-- Создание нового числа урона
-				local damage_number = {
-					expand_time = 0,                                    -- Время расширения анимации
-					time = 0,                                          -- Общее время жизни числа
-					start_time = t,                                    -- Время создания
-					duration = damage_number_settings.duration,         -- Длительность отображения
-					value = damage_diff,                               -- Значение урона
-					expand_duration = damage_number_settings.expand_duration,  -- Длительность расширения
-				}
-				damage_number.hit_weakspot = hit_weakspot      -- Попадание в слабое место
-				damage_number.was_critical = was_critical      -- Критическое попадание
-				damage_numbers[#damage_numbers + 1] = damage_number
+			-- Throttled buff_system DoT check (best-effort; may be unavailable on some units)
+			if not is_periodic_damage then
+				local next_check_t = marker._dot_check_next_t or 0
+				if t >= next_check_t then
+					marker._dot_check_next_t = t + 0.15
+					local buff_extension = ScriptUnit.has_extension(unit, "buff_system")
+					local has_dot = false
+					if buff_extension then
+						-- These are the most common periodic damage debuffs used across mods/content.
+						local bleed = buff_extension:current_stacks("bleed") or 0
+						local burn = (buff_extension:current_stacks("flamer_assault") or 0)
+							+ (buff_extension:current_stacks("warp_fire") or 0)
+						local toxin = (buff_extension:current_stacks("neurotoxin_interval_buff") or 0)
+							+ (buff_extension:current_stacks("neurotoxin_interval_buff2") or 0)
+							+ (buff_extension:current_stacks("neurotoxin_interval_buff3") or 0)
+							+ (buff_extension:current_stacks("exploding_toxin_interval_buff") or 0)
+						has_dot = (bleed + burn + toxin) > 0
+					end
+					marker._has_dot_debuff = has_dot
+				end
+				if marker._has_dot_debuff then
+					is_periodic_damage = true
+				end
+			end
 
-				-- Сброс флага добавления следующего числа
-				if content.add_on_next_number then
-					content.add_on_next_number = nil
+			-- Throttle DoT number spam: simply limit how often we show DoT damage numbers
+			-- No accumulation - just show current tick if enough time has passed since last DoT display
+			local skip_dot_tick = false
+			if is_periodic_damage then
+				local emit_interval = damage_number_settings.dot_emit_interval or 0.5
+				local last_emit_t = marker._dot_last_emit_t or 0
+				local can_emit = (t - last_emit_t) >= emit_interval
+
+				if not can_emit then
+					-- Too soon since last DoT display - completely skip this tick (don't add or merge)
+					skip_dot_tick = true
+				else
+					-- Enough time passed - show this DoT tick normally
+					marker._dot_last_emit_t = t
+				end
+			end
+
+			-- Don't process skipped DoT ticks at all
+			if not skip_dot_tick then
+				-- Only merge with previous number if it's not periodic or if current is also not periodic
+				-- DoT should not merge with non-DoT damage
+				local should_merge = false
+				if latest_damage_number and not is_periodic_damage then
+					-- Non-DoT can merge with previous if close in time (unless previous was DoT)
+					if not latest_damage_number.is_periodic 
+						and t - latest_damage_number.start_time < damage_number_settings.add_numbers_together_timer then
+						should_merge = true
+					end
 				end
 
-				-- Если было критическое попадание, следующее число будет добавлено отдельно
-				if was_critical then
-					content.add_on_next_number = true
+				if content.add_on_next_number or was_critical or not should_merge then
+					-- Создание нового числа урона
+					local damage_number = {
+						expand_time = 0,                                    -- Время расширения анимации
+						time = 0,                                          -- Общее время жизни числа
+						start_time = t,                                    -- Время создания
+						duration = damage_number_settings.duration,         -- Длительность отображения
+						value = math.ceil(damage_diff),                    -- Значение урона (rounded)
+						expand_duration = damage_number_settings.expand_duration,  -- Длительность расширения
+					}
+					damage_number.hit_weakspot = hit_weakspot      -- Попадание в слабое место
+					damage_number.was_critical = was_critical      -- Критическое попадание
+					damage_number.is_periodic = is_periodic_damage -- best-effort flag for future behavior
+					damage_numbers[#damage_numbers + 1] = damage_number
+
+					-- Сброс флага добавления следующего числа
+					if content.add_on_next_number then
+						content.add_on_next_number = nil
+					end
+
+					-- Если было критическое попадание, следующее число будет добавлено отдельно
+					if was_critical then
+						content.add_on_next_number = true
+					end
+				else
+					-- Объединение урона с предыдущим числом (только для не-DoT урона, близко по времени)
+					latest_damage_number.value = math.ceil(math.clamp(latest_damage_number.value + damage_diff, 0, max_health))
+					latest_damage_number.time = 0                    -- Сброс таймера
+					latest_damage_number.y_position = nil            -- Сброс позиции
+					latest_damage_number.start_time = t              -- Обновление времени начала
+					latest_damage_number.hit_weakspot = hit_weakspot -- Обновление информации о попадании
+					latest_damage_number.was_critical = was_critical
+					-- Don't change is_periodic flag when merging - keep original type
 				end
-			else
-				-- Объединение урона с предыдущим числом (попадания близко по времени)
-				latest_damage_number.value = math.clamp(latest_damage_number.value + damage_diff, 0, max_health)
-				latest_damage_number.time = 0                    -- Сброс таймера
-				latest_damage_number.y_position = nil            -- Сброс позиции
-				latest_damage_number.start_time = t              -- Обновление времени начала
-				latest_damage_number.hit_weakspot = hit_weakspot -- Обновление информации о попадании
-				latest_damage_number.was_critical = was_critical
 			end
 		end
 

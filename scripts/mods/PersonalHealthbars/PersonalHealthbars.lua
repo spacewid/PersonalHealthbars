@@ -75,14 +75,23 @@ mod:hook_safe(CLASS.AttackReportManager, "add_attack_result", function(self,
 	local local_player = Managers.player:local_player(1)
 	if local_player and local_player.player_unit == attacking_unit then
 		local dmg = tonumber(damage) or 0
-		if dmg > 0 then
+		-- Only track damage if attacked_unit is valid (not nil)
+		-- This prevents errors from buff damage, network sync issues, or environmental damage
+		if dmg > 0 and attacked_unit then
 			-- Track damage for this unit
 			mod._player_damage[attacked_unit] = (mod._player_damage[attacked_unit] or 0) + dmg
 			
 			-- Store hit info for this unit
+			local damage_profile_name = nil
+			-- damage_profile is usually a table; name/id fields vary by game version/content
+			if type(damage_profile) == "table" then
+				damage_profile_name = damage_profile.name or damage_profile.display_name or damage_profile_id
+			end
 			mod._last_hit_info[attacked_unit] = {
 				was_critical = is_critical_strike or false,
 				hit_weakspot = hit_weakspot or false,
+				attack_type = attack_type, -- e.g. melee/ranged/explosion/... (best-effort)
+				damage_profile_name = damage_profile_name, -- best-effort; may be nil
 				last_hit_zone_name = nil -- Will be set from health extension
 			}
 		end
